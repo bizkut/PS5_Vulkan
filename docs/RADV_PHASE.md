@@ -1027,3 +1027,19 @@ Console: PS5_FrameGen's FrameGen Lab on a base PS5, on a 1440p display.
 - Findings: HARDWARE_FINDINGS.md (2026-10-10).
 
 The release archive was rebuilt at the new pin (sha256 9563ad5d...).
+
+## 2026-10-12 — fragment shader barycentrics, in order
+
+`VK_KHR_fragment_shader_barycentric` is reported again, now put in order by the compiler instead of by hardware that does
+not do it. Mesa fork 1ba9874f478 (`radv/ps5: per-vertex fragment inputs in the primitive's own order`):
+
+1. The measurements are in HARDWARE_FINDINGS.md (2026-10-12) and BARYCENTRIC_GFX101.md: the slots are a rotation of the
+   primitive's order with the leftmost vertex first, and neither ROTATE_PC_PTR nor the provoking vertex argument says how.
+2. The last pre-rasterization stage (vertex, tessellation evaluation) exports a hash of the clip-space position, flat and per
+   vertex; the pixel shader finds the provoking vertex's slot by it. A pipeline library compiled alone does its half when the
+   device enabled the feature.
+3. `dEQP-VK.fragment_shading_barycentric`, the whole mustpass group on the console (PPSA99015, runs `bary-all-01` and the
+   ones before it in build/cts-runs): 18,254 of 20,991 pass; 2,593 mesh shader and 144 geometry shader cases do not.
+4. The smoke title's survey is now a set of checks (triangle list, strip, fan, lines in both provoking modes, `gl_BaryCoord`).
+   The full smoke on this archive: 127 passed, 1 failed (display: its modes, which counts 2 modes since the console's
+   resolution is 1440p, the 2026-10-10 entry).

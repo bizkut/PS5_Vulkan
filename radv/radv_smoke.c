@@ -22,6 +22,7 @@
 #include <stdint.h>
 #include <errno.h>
 #include <pthread.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -213,6 +214,8 @@ struct context {
    VkFence fence;
    /* VK_KHR_fragment_shader_barycentric is reported and enabled. */
    bool barycentric;
+   /* VK_EXT_provoking_vertex is reported and enabled. */
+   bool provoking;
    /* VK_KHR_fragment_shading_rate is reported, and its pipeline rate enabled. */
    bool shading_rate;
    /* VK_KHR_acceleration_structure is reported and enabled, with buffer
@@ -242,6 +245,7 @@ struct context {
       /* DRAW_MESH's workgroups. */
       uint32_t groups[3];
       bool restart;
+      bool provoking_last;
       VkBuffer indices;
       VkBuffer args;
       VkBuffer count;
@@ -645,7 +649,12 @@ render_readback_with(struct context *c, const char *what, const VkPipelineShader
       .viewportCount = 1,
       .scissorCount = 1,
    };
+   const VkPipelineRasterizationProvokingVertexStateCreateInfoEXT provoking_state = {
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_PROVOKING_VERTEX_STATE_CREATE_INFO_EXT,
+      .provokingVertexMode = VK_PROVOKING_VERTEX_MODE_LAST_VERTEX_EXT,
+   };
    const VkPipelineRasterizationStateCreateInfo raster = {
+      .pNext = c->draw.provoking_last ? &provoking_state : NULL,
       .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
       .polygonMode = VK_POLYGON_MODE_FILL,
       .cullMode = VK_CULL_MODE_NONE,
@@ -1150,6 +1159,272 @@ test_barycentric_pair(struct context *c)
    if (wrong)
       report("barycentric pair: %u texels wrong", wrong);
    check(ok && wrong == 0, "barycentric pair: each triangle's values read per vertex, in its vertex order");
+   vkDestroyShaderModule(c->device, vert, NULL);
+   vkDestroyShaderModule(c->device, frag, NULL);
+   buffer_destroy(c, &readback);
+}
+
+/* The order the pixel shader reads a primitive's per-vertex inputs in, against the order the primitive was drawn in
+ * (docs/BARYCENTRIC_GFX101.md). The shader (bary.frag) writes vertex_id[0], [1] and [2] as red, green and blue; every
+ * vertex names itself, so a texel says which vertices arrived in which slot, and the three values name the primitive.
+ * This only reports: what the console does decides the fix. One line a primitive and order seen; a primitive whose
+ * texels disagree among themselves shows two lines. perm=abc means slot j holds the primitive's vertex "abc[j]" of
+ * its natural order (vertices first, second, third as drawn), so 012 is in order, 201 is rotated by one. */
+static void
+survey_case(struct context *c, const char *name, uint32_t which, VkPrimitiveTopology topology, uint32_t vertices,
+            VkShaderModule vert, VkShaderModule frag, struct buffer *readback)
+{
+   const VkSpecializationMapEntry entry = {.constantID = 0, .offset = 0, .size = sizeof(which)};
+   const VkSpecializationInfo specialisation = {
+      .mapEntryCount = 1, .pMapEntries = &entry, .dataSize = sizeof(which), .pData = &which};
+   VkPipelineShaderStageCreateInfo stages[2] = {
+      stage_info(VK_SHADER_STAGE_VERTEX_BIT, vert),
+      stage_info(VK_SHADER_STAGE_FRAGMENT_BIT, frag),
+   };
+   stages[0].pSpecializationInfo = &specialisation;
+   if (!render_readback(c, name, stages, 2, topology, 0, vertices, readback)) {
+      check(false, name);
+      return;
+   }
+   /* A texel's three values add up to a number no other primitive's do. */
+   enum { KEYS = 256, ORDERS = 6 };
+   static uint32_t seen[KEYS][ORDERS], count[KEYS][ORDERS];
+   memset(seen, 0, sizeof(seen));
+   memset(count, 0, sizeof(count));
+   const uint32_t *const texels = readback->map;
+   for (uint32_t i = 0; i < TARGET_SIZE * TARGET_SIZE; i++) {
+      const uint32_t t = texels[i];
+      if ((t >> 24) != 0xff || t == 0xffff0000u)   /* not drawn: the target's blue */
+         continue;
+      const uint32_t a = t & 0xff, b = (t >> 8) & 0xff, d = (t >> 16) & 0xff;
+      const uint32_t key = a + b + d;
+      if (key >= KEYS)
+         continue;
+      for (uint32_t o = 0; o < ORDERS; o++) {
+         if (!count[key][o]) {
+            seen[key][o] = t & 0xffffff;
+            count[key][o] = 1;
+            break;
+         }
+         if (seen[key][o] == (t & 0xffffff)) {
+            count[key][o]++;
+            break;
+         }
+      }
+   }
+   uint32_t primitives = 0, in_order = 0;
+   for (uint32_t key = 0; key < KEYS; key++) {
+      if (!count[key][0])
+         continue;
+      primitives++;
+      /* The primitive's vertices in the order the specification gives the pixel shader, the provoking vertex first
+       * (the CTS's formulas): a list's p-th is 3p, 3p+1, 3p+2 (ids one more); a strip's t-th is t, t+1, t+2 and, when t is
+       * odd, t, t+2, t+1; a fan's is t+1, t+2, 0. Its key is the sum of the three ids. */
+      uint32_t natural[3];
+      if (topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST) {
+         const uint32_t p = (key - 6) / 9;
+         natural[0] = 3 * p + 1, natural[1] = 3 * p + 2, natural[2] = 3 * p + 3;
+      } else if (topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP) {
+         const uint32_t t = (key - 6) / 3;
+         natural[0] = t + 1, natural[1] = (t & 1) ? t + 3 : t + 2, natural[2] = (t & 1) ? t + 2 : t + 3;
+      } else {
+         const uint32_t t = (key - 6) / 2;
+         natural[0] = t + 2, natural[1] = t + 3, natural[2] = 1;
+      }
+      for (uint32_t o = 0; o < ORDERS && count[key][o]; o++) {
+         const uint32_t slots[3] = {seen[key][o] & 0xff, (seen[key][o] >> 8) & 0xff, (seen[key][o] >> 16) & 0xff};
+         char perm[4] = "???";
+         for (uint32_t j = 0; j < 3; j++)
+            for (uint32_t n = 0; n < 3; n++)
+               if (slots[j] == natural[n])
+                  perm[j] = (char)('0' + n);
+         if (!strcmp(perm, "012") && o == 0 && !count[key][1])
+            in_order++;
+         report("survey %s: primitive %u (vertices %u %u %u): perm=%s in %u texels", name, key, natural[0], natural[1],
+                natural[2], perm, count[key][o]);
+      }
+   }
+   report("survey %s: %u primitives seen, %u in order", name, primitives, in_order);
+   char description[160];
+   snprintf(description, sizeof(description), "survey %s: every primitive's vertices read in its own order", name);
+   check(primitives >= 16 && in_order == primitives, description);
+}
+
+/* The same list triangles as survey case 0 and 1, read through gl_BaryCoord: with the corners in API order, a
+ * pixel's coordinates are its weights on the first, second and third vertex as drawn. For each primitive, which of
+ * the six orders of the three channels matches the weights the pixel has, and in how many of its texels. */
+static void
+survey_bary_coord(struct context *c, const char *name, uint32_t which, VkShaderModule vert, VkShaderModule frag,
+                  struct buffer *readback)
+{
+   const VkSpecializationMapEntry entry = {.constantID = 0, .offset = 0, .size = sizeof(which)};
+   const VkSpecializationInfo specialisation = {
+      .mapEntryCount = 1, .pMapEntries = &entry, .dataSize = sizeof(which), .pData = &which};
+   VkPipelineShaderStageCreateInfo stages[2] = {
+      stage_info(VK_SHADER_STAGE_VERTEX_BIT, vert),
+      stage_info(VK_SHADER_STAGE_FRAGMENT_BIT, frag),
+   };
+   stages[0].pSpecializationInfo = &specialisation;
+   if (!render_readback(c, name, stages, 2, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, 0, 48, readback)) {
+      check(false, name);
+      return;
+   }
+   static const float corners[3][2] = {{8.0f, 8.0f}, {8.0f, 56.0f}, {56.0f, 40.0f}};
+   static const uint32_t orders[6][3] = {{0, 1, 2}, {1, 2, 0}, {2, 0, 1}, {0, 2, 1}, {2, 1, 0}, {1, 0, 2}};
+   static const uint32_t channels[6][3] = {{0, 1, 2}, {1, 2, 0}, {2, 0, 1}, {0, 2, 1}, {2, 1, 0}, {1, 0, 2}};
+   const uint8_t *const bytes = readback->map;
+   uint32_t good = 0;
+   for (uint32_t p = 0; p < 16; p++) {
+      float px[3], py[3];
+      for (uint32_t i = 0; i < 3; i++) {
+         const uint32_t k = which == 0 ? i : orders[p % 6][i];
+         px[i] = (float)(p % 4) * 64.0f + corners[k][0];
+         py[i] = (float)(p / 4) * 64.0f + corners[k][1];
+      }
+      const float area = (px[1] - px[0]) * (py[2] - py[0]) - (px[2] - px[0]) * (py[1] - py[0]);
+      if (getenv("RADV_PS5_BARY_DEBUG")) {
+         /* The raw texels three pixels in from each corner, toward the centre. */
+         const float cx = (px[0] + px[1] + px[2]) / 3.0f, cy = (py[0] + py[1] + py[2]) / 3.0f;
+         char raw[96] = "";
+         for (uint32_t i = 0; i < 3; i++) {
+            const float dx = cx - px[i], dy = cy - py[i], len = sqrtf(dx * dx + dy * dy);
+            const uint32_t x = (uint32_t)(px[i] + 4.0f * dx / len), y = (uint32_t)(py[i] + 4.0f * dy / len);
+            const uint8_t *t = bytes + (y * TARGET_SIZE + x) * 4;
+            snprintf(raw + strlen(raw), sizeof(raw) - strlen(raw), " v%u(%u,%u)=%02x%02x%02x", i, x, y, t[0], t[1], t[2]);
+         }
+         report("survey %s: triangle %u raw:%s", name, p, raw);
+      }
+      uint32_t match[6] = {0}, texels = 0;
+      for (uint32_t y = (p / 4) * 64; y < (p / 4) * 64 + 64; y++) {
+         for (uint32_t x = (p % 4) * 64; x < (p % 4) * 64 + 64; x++) {
+            const uint8_t *t = bytes + (y * TARGET_SIZE + x) * 4;
+            if (t[3] != 0xff)
+               continue;
+            const float fx = (float)x + 0.5f, fy = (float)y + 0.5f;
+            float w[3];
+            w[1] = ((fx - px[0]) * (py[2] - py[0]) - (px[2] - px[0]) * (fy - py[0])) / area;
+            w[2] = ((px[1] - px[0]) * (fy - py[0]) - (fx - px[0]) * (py[1] - py[0])) / area;
+            w[0] = 1.0f - w[1] - w[2];
+            if (w[0] < 0.1f || w[1] < 0.1f || w[2] < 0.1f)
+               continue;   /* near an edge a half texel moves the weights */
+            texels++;
+            for (uint32_t m = 0; m < 6; m++) {
+               bool all = true;
+               for (uint32_t j = 0; j < 3; j++) {
+                  const float seen = (float)t[j] / 255.0f, want = w[channels[m][j]];
+                  all = all && seen > want - 0.03f && seen < want + 0.03f;
+               }
+               match[m] += all;
+            }
+         }
+      }
+      uint32_t best = 0;
+      for (uint32_t m = 1; m < 6; m++)
+         if (match[m] > match[best])
+            best = m;
+      good += best == 0 && match[0] == texels;
+      report("survey %s: triangle %u: channels read as vertices %u%u%u in %u of %u texels", name, p,
+             channels[best][0], channels[best][1], channels[best][2], match[best], texels);
+   }
+   report("survey %s: %u of 16 triangles read in API order", name, good);
+   char description[160];
+   snprintf(description, sizeof(description), "survey %s: every triangle's barycentric coordinates follow its vertices' order", name);
+   check(good == 16, description);
+}
+
+/* Lines: two vertices, so two slots. The pixel shader writes slot 0 and slot 1; the key is their sum, which no other line's
+ * is. A list's p-th line is vertices 2p, 2p+1 (ids 2p+1, 2p+2), a strip's is p, p+1. perm=01 is in order, 10 swapped. */
+static void
+survey_lines(struct context *c, const char *name, uint32_t which, VkPrimitiveTopology topology, uint32_t vertices,
+             bool provoking_last, VkShaderModule vert, VkShaderModule frag, struct buffer *readback)
+{
+   const VkSpecializationMapEntry entry = {.constantID = 0, .offset = 0, .size = sizeof(which)};
+   const VkSpecializationInfo specialisation = {
+      .mapEntryCount = 1, .pMapEntries = &entry, .dataSize = sizeof(which), .pData = &which};
+   VkPipelineShaderStageCreateInfo stages[2] = {
+      stage_info(VK_SHADER_STAGE_VERTEX_BIT, vert),
+      stage_info(VK_SHADER_STAGE_FRAGMENT_BIT, frag),
+   };
+   stages[0].pSpecializationInfo = &specialisation;
+   c->draw.provoking_last = provoking_last;
+   const bool ok = render_readback(c, name, stages, 2, topology, 0, vertices, readback);
+   c->draw.provoking_last = false;
+   if (!ok) {
+      check(false, name);
+      return;
+   }
+   uint32_t seen[256][2] = {{0}}, count[256][2] = {{0}}, lines = 0, in_order = 0;
+   const uint32_t *const texels = readback->map;
+   for (uint32_t i = 0; i < TARGET_SIZE * TARGET_SIZE; i++) {
+      const uint32_t t = texels[i];
+      if ((t >> 24) != 0xff || t == 0xffff0000u)   /* not drawn: the target's blue */
+         continue;
+      const uint32_t a = t & 0xff, b = (t >> 8) & 0xff, key = a + b;
+      if (key >= 256)
+         continue;
+      for (uint32_t o = 0; o < 2; o++) {
+         if (!count[key][o]) {
+            seen[key][o] = t & 0xffff, count[key][o] = 1;
+            break;
+         }
+         if (seen[key][o] == (t & 0xffff)) {
+            count[key][o]++;
+            break;
+         }
+      }
+   }
+   for (uint32_t key = 0; key < 256; key++) {
+      if (!count[key][0])
+         continue;
+      lines++;
+      for (uint32_t o = 0; o < 2 && count[key][o]; o++) {
+         const uint32_t a = seen[key][o] & 0xff, b = seen[key][o] >> 8;
+         const uint32_t low = a < b ? a : b;
+         /* The vertices as drawn are the lower id then the higher, in a list and in a strip. */
+         const char *perm = a == low ? "01" : "10";
+         if (a == low && o == 0 && !count[key][1])
+            in_order++;
+         report("survey %s: line (vertices %u %u): perm=%s in %u texels", name, low, low + 1, perm, count[key][o]);
+      }
+   }
+   report("survey %s: %u lines seen, %u in order", name, lines, in_order);
+   char description[160];
+   snprintf(description, sizeof(description), "survey %s: every line's vertices read in its own order", name);
+   check(lines >= 16 && in_order == lines, description);
+}
+
+static void
+test_barycentric_survey(struct context *c)
+{
+   struct buffer readback;
+   if (!buffer_create(c, TARGET_SIZE * TARGET_SIZE * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT, &readback)) {
+      check(false, "barycentric survey: readback buffer");
+      return;
+   }
+   VkShaderModule vert = shader(c, radv_smoke_bary_survey_vert, sizeof(radv_smoke_bary_survey_vert));
+   VkShaderModule frag = shader(c, radv_smoke_bary_frag, sizeof(radv_smoke_bary_frag));
+   if (vert && frag) {
+      survey_case(c, "list, one order", 0, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, 48, vert, frag, &readback);
+      survey_case(c, "list, six orders", 1, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, 48, vert, frag, &readback);
+      survey_case(c, "strip", 2, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP, 18, vert, frag, &readback);
+      survey_case(c, "fan", 3, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN, 18, vert, frag, &readback);
+   }
+   VkShaderModule line_frag = shader(c, radv_smoke_bary_line_frag, sizeof(radv_smoke_bary_line_frag));
+   if (vert && line_frag) {
+      survey_lines(c, "line list, first", 4, VK_PRIMITIVE_TOPOLOGY_LINE_LIST, 32, false, vert, line_frag, &readback);
+      survey_lines(c, "line strip, first", 5, VK_PRIMITIVE_TOPOLOGY_LINE_STRIP, 17, false, vert, line_frag, &readback);
+      if (c->provoking) {
+         survey_lines(c, "line list, last", 4, VK_PRIMITIVE_TOPOLOGY_LINE_LIST, 32, true, vert, line_frag, &readback);
+         survey_lines(c, "line strip, last", 5, VK_PRIMITIVE_TOPOLOGY_LINE_STRIP, 17, true, vert, line_frag, &readback);
+      }
+   }
+   vkDestroyShaderModule(c->device, line_frag, NULL);
+   VkShaderModule coord = shader(c, radv_smoke_bary_coord_frag, sizeof(radv_smoke_bary_coord_frag));
+   if (vert && coord) {
+      survey_bary_coord(c, "gl_BaryCoord, list, one order", 0, vert, coord, &readback);
+      survey_bary_coord(c, "gl_BaryCoord, list, six orders", 1, vert, coord, &readback);
+   }
+   vkDestroyShaderModule(c->device, coord, NULL);
    vkDestroyShaderModule(c->device, vert, NULL);
    vkDestroyShaderModule(c->device, frag, NULL);
    buffer_destroy(c, &readback);
@@ -2299,11 +2574,13 @@ context_create(struct context *c)
    VkExtensionProperties extensions[512];
    uint32_t extension_count = sizeof(extensions) / sizeof(extensions[0]);
    c->barycentric = false;
+   c->provoking = false;
    c->shading_rate = false;
    c->acceleration_structure = false;
    if (vkEnumerateDeviceExtensionProperties(c->physical, NULL, &extension_count, extensions) >= VK_SUCCESS) {
       for (uint32_t i = 0; i < extension_count; i++) {
          c->barycentric |= strcmp(extensions[i].extensionName, VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME) == 0;
+         c->provoking |= strcmp(extensions[i].extensionName, VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME) == 0;
          c->shading_rate |= strcmp(extensions[i].extensionName, VK_KHR_FRAGMENT_SHADING_RATE_EXTENSION_NAME) == 0;
          c->acceleration_structure |=
             strcmp(extensions[i].extensionName, VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME) == 0;
@@ -2339,6 +2616,15 @@ context_create(struct context *c)
       features12.bufferDeviceAddress = VK_TRUE;
       acceleration_structure.pNext = features13.pNext;
       features13.pNext = &acceleration_structure;
+   }
+   VkPhysicalDeviceProvokingVertexFeaturesEXT provoking = {
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROVOKING_VERTEX_FEATURES_EXT,
+      .provokingVertexLast = VK_TRUE,
+   };
+   if (c->provoking) {
+      device_extensions[enabled_extensions++] = VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME;
+      provoking.pNext = features13.pNext;
+      features13.pNext = &provoking;
    }
    if (c->barycentric) {
       device_extensions[enabled_extensions++] = VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME;
@@ -2693,6 +2979,16 @@ main(void)
    if (ready && only && strcmp(only, "task") == 0) {
       if (c.task)
          test_task(&c);
+   } else if (ready && only && strcmp(only, "barycentric") == 0) {
+      /* The barycentric survey alone (docs/BARYCENTRIC_GFX101.md): runs where the rest of the checks do not, such as
+       * with RADV_DEBUG=nongg, which a legacy geometry shader hangs. */
+      if (c.barycentric) {
+         test_barycentric(&c);
+         test_barycentric_pair(&c);
+         test_barycentric_survey(&c);
+      } else {
+         report("barycentric: VK_KHR_fragment_shader_barycentric is not reported");
+      }
    } else if (ready) {
       test_fill(&c);
       test_copy(&c);
@@ -2708,6 +3004,7 @@ main(void)
       if (c.barycentric) {
          test_barycentric(&c);
          test_barycentric_pair(&c);
+         test_barycentric_survey(&c);
       } else {
          report("barycentric: VK_KHR_fragment_shader_barycentric is not reported; its checks are skipped");
       }

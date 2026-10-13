@@ -72,9 +72,13 @@ Upstream RADV offers these on Navi21; the port does not yet.
 No work, each reason recorded where it was measured.
 
 - **Hardware** (the GPU's fixed-function blocks are GC 10.1.3's,
-  HARDWARE_FINDINGS.md): variable-rate shading (96,530), fragment
-  barycentrics (8,313), RGB9E5 as a colour target, accelerated dot products
-  and VK_VALVE_shader_mixed_float_dot_product.
+  HARDWARE_FINDINGS.md): variable-rate shading (96,530), RGB9E5 as a colour
+  target, accelerated dot products and VK_VALVE_shader_mixed_float_dot_product.
+- **Fragment barycentrics** are reported since 2026-10-12, put in order by the
+  compiler because the parameter cache rotates them (BARYCENTRIC_GFX101.md):
+  `dEQP-VK.fragment_shading_barycentric`, the whole mustpass group, 18,254 of
+  20,991 pass. The 2,737 left are 2,593 with a mesh shader and 144 with a
+  geometry shader, whose primitives get no vertex tags.
 - **Platform**: device-generated commands (238; B8, command fetch in the
   system context), performance queries (13; no exported stable power state),
   Linux file descriptors, dma-buf and DRM (52,824), other window systems,

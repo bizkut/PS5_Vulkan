@@ -3833,3 +3833,28 @@ to single bits where a run differed:
 So a 0 from IsOutputSupported means the console's present output has no
 120 Hz format, and it changes with the console's settings. PS5_Mesa 47e9eb6
 configures the mode only on a positive answer.
+
+## 2026-10-12 — the parameter cache rotates a primitive's vertices to the leftmost first (RADV)
+
+The 2026-09-27 entry found that per-vertex fragment inputs arrive rotated. What the rotation is, measured with the RADV
+smoke title's survey (`radv/radv_smoke.c`, `test_barycentric_survey`; every vertex names itself and the pixel shader writes
+the three values it reads per vertex as red, green and blue; PPSA99014, klog 20261012-221445 to -222201):
+
+- The three slots are always a cyclic rotation of the primitive's own vertex order, in its winding (strips' odd triangles
+  included: their own order is (n+1, n, n+2)). 16 triangles a case, 1,144 texels each, never a reflection.
+- Slot 0 holds the vertex furthest left on the screen, then furthest up. Six orders of one set of corners in a triangle list:
+  `012`, `201`, `120`, `012`, `201`, `120`, each repeating at the same corners; a 16-triangle fan read `012` where the centre
+  was leftmost, `201` and `120` in the other quadrants, and `012` again.
+- It does not depend on the primitive's index in the draw (16 identical triangles all `012`), nor on NGG (`RADV_DEBUG=nongg`
+  gave the same table; legacy geometry shaders hang there, so only the barycentric checks were run), nor on
+  `SPI_PS_INPUT_CNTL.ROTATE_PC_PTR`.
+- `SPI_SHADER_PGM_RSRC1_PS.LOAD_PROVOKING_VTX` (GFX10.3+) was set and the SGPR read 0 for every quad of every triangle, so RADV's
+  `gl_BaryCoord` lowering, which selects its barycentrics by it, was rotated the same way: 6 of 16 triangles in order, six
+  orders.
+- A flat input carries the provoking vertex's value correctly: a vertex shader writing a per-vertex tag once flat and once
+  per vertex, and a pixel shader taking the slot whose tag is the flat one as the first, read all 16 triangles in order in
+  both six-order and one-order lists (klog 20261012-222201).
+
+Fixed in the compiler (BARYCENTRIC_GFX101.md): the extension is reported, and the whole barycentric group of the CTS
+(20,991 cases) passes but for the mesh shader and geometry shader ones (18,254). The CTS found a flaw in the first tag: a hash by
+xor of products cancels the sign bits of (-1, -1) and (1, 1), the corners of the CTS's own quad.
