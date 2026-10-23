@@ -46,6 +46,7 @@
  */
 
 #include "ps5vk_private.h"
+#include "ps5vk_output_mode.h"
 
 #include <assert.h>
 #include <pthread.h>
@@ -95,7 +96,7 @@ ps5vk_display_mode_handle(struct ps5vk_display *mode)
    return (VkDisplayModeKHR)(uintptr_t)mode;
 }
 
-static bool ps5vk_title_declares_high_frame_rate(void);
+static uint32_t ps5vk_title_attribute3(void);
 
 /* The output-mode selector, and the mode that restores the default output. 15
  * came from the publicly released ps5-opengl runtime and was proved on the
@@ -117,7 +118,7 @@ static bool ps5vk_output_retained;
  * handover report measures. */
 static uint64_t ps5vk_output_last_present_ns;
 
-static struct ps5vk_video_out *ps5vk_output_open_handle(bool high_frame_rate);
+static struct ps5vk_video_out *ps5vk_output_open_handle(uint32_t attribute3);
 static void ps5vk_output_close(void);
 
 /* Which modes the display offers, settled once per physical device: the
@@ -138,11 +139,13 @@ ps5vk_display_settle_modes(struct ps5vk_physical_device *device)
       return;
    device->modes_settled = true;
    device->mode = (struct ps5vk_display){.refresh_millihertz = PS5VK_DISPLAY_REFRESH_MILLIHERTZ};
+   const uint32_t attribute3 = ps5vk_title_attribute3();
    device->high_mode = (struct ps5vk_display){
       .refresh_millihertz = PS5VK_DISPLAY_HIGH_REFRESH_MILLIHERTZ,
+      .attribute3 = attribute3,
       .high_frame_rate = true,
    };
-   if (!ps5vk_title_declares_high_frame_rate())
+   if ((attribute3 & PS5VK_ATTRIBUTE3_HIGH_FRAME_RATE) == 0)
       return;
    pthread_mutex_lock(&ps5vk_output_lock);
    /* An output a swapchain holds keeps its mode; one retained without a
@@ -150,7 +153,7 @@ ps5vk_display_settle_modes(struct ps5vk_physical_device *device)
    if (ps5vk_output != NULL && !ps5vk_output->owned && !ps5vk_output->high_frame_rate)
       ps5vk_output_close();
    if (ps5vk_output == NULL)
-      ps5vk_output = ps5vk_output_open_handle(true);
+      ps5vk_output = ps5vk_output_open_handle(attribute3);
    device->high_mode_offered = ps5vk_output != NULL && ps5vk_output->high_frame_rate;
    /* A refused output is not kept open: the swapchain opens its own. */
    if (ps5vk_output != NULL && !ps5vk_output->owned && !ps5vk_output->registered &&
@@ -552,14 +555,13 @@ ps5vk_output_vblank_period_ns(int handle)
  * fresh handle, before the flip rate, which is where the console accepted it. A
  * refusal is not an error: the output presents at 59.94 Hz, and says so once.
  *
- * An accepted mode is not yet a 120 Hz output. A tester's console accepted it
- * and its display went on refreshing at 60 Hz -- RetroArch then showed each
- * frame twice for 119.88 Hz and every core ran at exactly half speed with
- * V-Sync on -- so the vblank period is timed here, and an output that does not
- * refresh at 119.88 Hz is put back to 59.94 Hz before any mode is reported.
- * NULL when VideoOut does not open. */
+ * A fixed-rate title verifies the accepted mode from vblanks: a tester's
+ * console accepted it while its display remained at 60 Hz. A retail VRR title
+ * does not: before the first presents its output may legitimately idle at the
+ * 48 Hz floor, so a successful configuration is authoritative. NULL when
+ * VideoOut does not open. */
 static struct ps5vk_video_out *
-ps5vk_output_open_handle(bool high_frame_rate)
+ps5vk_output_open_handle(uint32_t attribute3)
 {
    struct ps5vk_video_out *const video = calloc(1, sizeof(*video));
    if (video == NULL)
@@ -571,25 +573,36 @@ ps5vk_output_open_handle(bool high_frame_rate)
       free(video);
       return NULL;
    }
-   if (high_frame_rate) {
+   if ((attribute3 & PS5VK_ATTRIBUTE3_HIGH_FRAME_RATE) != 0) {
       const int supported = sceVideoOutIsOutputSupported(
          video->handle, PS5VK_VIDEO_OUT_MODE_HIGH_FRAME_RATE, NULL, NULL, NULL);
       const int configured =
          supported > 0 ? sceVideoOutConfigureOutput(
                             video->handle, PS5VK_VIDEO_OUT_MODE_HIGH_FRAME_RATE, NULL, NULL, NULL)
-                       : supported;
-      video->high_frame_rate = configured == 0;
+                       : -1;
+      const enum ps5vk_high_refresh_policy policy =
+         ps5vk_choose_high_refresh(attribute3, supported, configured);
+      video->high_frame_rate = policy != PS5VK_HIGH_REFRESH_UNAVAILABLE;
       char line[200];
-      if (configured == 0) {
+      if (policy == PS5VK_HIGH_REFRESH_TRUST_VRR) {
+         snprintf(line, sizeof(line),
+                  "[ps5vk] output: 119.88 Hz selected with title VRR metadata\n");
+      } else if (policy == PS5VK_HIGH_REFRESH_VERIFY_FIXED) {
          const uint64_t period = ps5vk_output_vblank_period_ns(video->handle);
-         if (period > PS5VK_OUTPUT_HIGH_REFRESH_LIMIT_NS) {
+         if (period == 0 || period > PS5VK_OUTPUT_HIGH_REFRESH_LIMIT_NS) {
             const int restored = sceVideoOutConfigureOutput(
                video->handle, PS5VK_VIDEO_OUT_MODE_RESTORE, NULL, NULL, NULL);
             video->high_frame_rate = false;
-            snprintf(line, sizeof(line),
-                     "[ps5vk] output: 119.88 Hz accepted, but a vblank comes every %.3f ms; "
-                     "the display is not refreshing at 120 Hz, so 59.94 Hz is restored (0x%08x)\n",
-                     (double)period / 1e6, (unsigned)restored);
+            if (period == 0)
+               snprintf(line, sizeof(line),
+                        "[ps5vk] output: 119.88 Hz accepted, but a vblank wait failed; "
+                        "59.94 Hz is restored (0x%08x)\n",
+                        (unsigned)restored);
+            else
+               snprintf(line, sizeof(line),
+                        "[ps5vk] output: 119.88 Hz accepted, but a vblank comes every %.3f ms; "
+                        "the display is not refreshing at 120 Hz, so 59.94 Hz is restored (0x%08x)\n",
+                        (double)period / 1e6, (unsigned)restored);
          } else {
             snprintf(line, sizeof(line), "[ps5vk] output: 119.88 Hz selected, a vblank every %.3f ms\n",
                      (double)period / 1e6);
@@ -598,7 +611,7 @@ ps5vk_output_open_handle(bool high_frame_rate)
          snprintf(line, sizeof(line),
                   supported > 0 ? "[ps5vk] output: 119.88 Hz refused (0x%08x); presenting at 59.94 Hz\n"
                                 : "[ps5vk] output: 119.88 Hz not supported (%d); presenting at 59.94 Hz\n",
-                  configured);
+                  supported > 0 ? configured : supported);
       }
       fputs(line, stderr);
    }
@@ -647,9 +660,10 @@ ps5vk_video_out_register(struct ps5vk_device *device, struct ps5vk_video_out *vi
  * otherwise. A retained output keeps its framebuffers and the image on screen,
  * which stays there until the new swapchain's first present. */
 static VkResult
-ps5vk_video_out_open(struct ps5vk_device *device, bool high_frame_rate,
+ps5vk_video_out_open(struct ps5vk_device *device, uint32_t attribute3,
                      struct ps5vk_video_out **opened)
 {
+   bool high_frame_rate = (attribute3 & PS5VK_ATTRIBUTE3_HIGH_FRAME_RATE) != 0;
    pthread_mutex_lock(&ps5vk_output_lock);
    if (ps5vk_output != NULL && ps5vk_output->owned) {
       pthread_mutex_unlock(&ps5vk_output_lock);
@@ -659,12 +673,14 @@ ps5vk_video_out_open(struct ps5vk_device *device, bool high_frame_rate,
    /* A mode other than the output's is a fresh output: switching a registered
     * output is not what the console was measured doing. The high-frame-rate
     * mode is offered only where the output took it, so a refused one stays. */
-   if (ps5vk_output != NULL && high_frame_rate && !ps5vk_output->high_frame_rate)
+   if (ps5vk_output != NULL && high_frame_rate && !ps5vk_output->high_frame_rate) {
+      attribute3 = 0;
       high_frame_rate = false;
+   }
    if (ps5vk_output != NULL && ps5vk_output->high_frame_rate != high_frame_rate)
       ps5vk_output_close();
    if (ps5vk_output == NULL)
-      ps5vk_output = ps5vk_output_open_handle(high_frame_rate);
+      ps5vk_output = ps5vk_output_open_handle(attribute3);
    if (ps5vk_output == NULL) {
       pthread_mutex_unlock(&ps5vk_output_lock);
       return vk_errorf(device, VK_ERROR_INITIALIZATION_FAILED, "sceVideoOutOpen failed");
@@ -843,7 +859,7 @@ ps5vk_CreateSwapchainKHR(VkDevice _device, const VkSwapchainCreateInfoKHR *pCrea
       const struct ps5vk_display *const mode =
          (const struct ps5vk_display *)(uintptr_t)surface->displayMode;
       const VkResult opened =
-         ps5vk_video_out_open(device, mode != NULL && mode->high_frame_rate, &video);
+         ps5vk_video_out_open(device, mode != NULL ? mode->attribute3 : 0, &video);
       if (opened != VK_SUCCESS) {
          vk_object_free(&device->vk, pAllocator, swapchain);
          return opened;
@@ -1169,28 +1185,25 @@ ps5vk_debug_video_handle(VkDevice _device)
    return device != NULL && device->video_out != NULL ? device->video_out->handle : -1;
 }
 
-/* Whether the title's own metadata declares high-frame-rate output: attribute3
- * holds 0x80040 (the value the publicly released ps5-opengl SDK's folder builder
- * sets above 60 Hz), in /app0/sce_sys/param.json. The console refused the mode
- * with 0x80290016 until the port declared it and accepted it after, so asking
- * for it without the declaration would only be refused. */
-#define PS5VK_ATTRIBUTE3_HIGH_FRAME_RATE 0x80040u
-static bool
-ps5vk_title_declares_high_frame_rate(void)
+/* The title's own metadata. Bit 0x40 declares high-frame-rate output; retail
+ * VRR titles pair it with 0x40000, while the older 0x80000 pairing disables
+ * the system VRR path. Without the high-frame-rate bit the console refuses
+ * mode 15 with 0x80290016. */
+static uint32_t
+ps5vk_title_attribute3(void)
 {
    FILE *const file = fopen("/app0/sce_sys/param.json", "rb");
    if (file == NULL)
-      return false;
+      return 0;
    char text[16384];
    const size_t length = fread(text, 1, sizeof(text) - 1, file);
    fclose(file);
    text[length] = '\0';
    const char *at = strstr(text, "\"attribute3\"");
    if (at == NULL)
-      return false;
+      return 0;
    at = strchr(at, ':');
    if (at == NULL)
-      return false;
-   const unsigned long value = strtoul(at + 1, NULL, 0);
-   return (value & PS5VK_ATTRIBUTE3_HIGH_FRAME_RATE) == PS5VK_ATTRIBUTE3_HIGH_FRAME_RATE;
+      return 0;
+   return (uint32_t)strtoul(at + 1, NULL, 0);
 }

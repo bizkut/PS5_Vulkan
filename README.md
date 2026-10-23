@@ -66,10 +66,18 @@ is the round-by-round record.
         |                       submissions, each ending with a write of its
         |                       sequence number, which the CPU waits for
   VK_KHR_display on VideoOut .. the swapchain: buffers registered with
-        |                       VideoOut, flipped at vblank, 120 Hz where the
-        |                       title declares it and the display takes it
+        |                       VideoOut, flipped at vblank, fixed 120 Hz or
+        |                       retail VRR where the title declares it and the
+        |                       display takes it
   PS5 GPU
 ```
+
+High-refresh metadata always carries `attribute3` bit `0x40`.
+`sce_sys/param-runner-vrr.json` pairs it with retail VRR bit `0x40000`;
+`sce_sys/param-runner-hfr.json` retains the older `0x80000` pairing as the
+fixed-rate diagnostic. A VRR output may idle at its 48 Hz floor before the
+first presents, so the driver trusts a successful mode change for the VRR
+fixture while retaining measured-vblank verification for the fixed-rate one.
 
 What stands on the console (2026-10-01, PS5 Mesa `504adad`):
 
