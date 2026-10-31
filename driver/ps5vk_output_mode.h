@@ -30,4 +30,19 @@ ps5vk_choose_high_refresh(uint32_t attribute3, int supported, int configured)
    return PS5VK_HIGH_REFRESH_VERIFY_FIXED;
 }
 
+/* Bare VRR vblanks may idle slowly; only the observed 59.94 Hz band
+ * contradicts the configured high-refresh mode. Fixed-rate titles retain
+ * the stricter midpoint check. A failed measurement never qualifies. */
+static inline int
+ps5vk_keep_high_refresh(enum ps5vk_high_refresh_policy policy, uint64_t period_ns)
+{
+   if (period_ns == 0)
+      return 0;
+   if (policy == PS5VK_HIGH_REFRESH_VERIFY_FIXED)
+      return period_ns <= UINT64_C(12500000);
+   if (policy == PS5VK_HIGH_REFRESH_TRUST_VRR)
+      return period_ns < UINT64_C(16200000) || period_ns > UINT64_C(17200000);
+   return 0;
+}
+
 #endif

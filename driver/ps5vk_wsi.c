@@ -114,6 +114,9 @@ static uint32_t ps5vk_title_attribute3(void);
 static pthread_mutex_t ps5vk_output_lock = PTHREAD_MUTEX_INITIALIZER;
 static struct ps5vk_video_out *ps5vk_output;
 static bool ps5vk_output_retained;
+/* A failed restore leaves the output mode uncertain; do not open a new
+ * swapchain on a presumed default mode. Protected by ps5vk_output_lock. */
+static bool ps5vk_output_restore_failed;
 /* When the process last presented, on any output: the start of the gap a
  * handover report measures. */
 static uint64_t ps5vk_output_last_present_ns;
@@ -519,11 +522,8 @@ ps5vk_output_close(void)
    ps5vk_output = NULL;
 }
 
-/* The vblanks timed after the high-frame-rate mode is configured, and the
- * period above which the output is not refreshing at 119.88 Hz: halfway
- * between the 8.342 ms and 16.683 ms R92 measured for the two modes. */
+/* The vblanks timed after the high-frame-rate mode is configured. */
 #define PS5VK_OUTPUT_CHECK_INTERVALS 6
-#define PS5VK_OUTPUT_HIGH_REFRESH_LIMIT_NS UINT64_C(12500000)
 
 /* The output's refresh period in nanoseconds: the median of a few intervals
  * between bare vblank waits, the first wait only finding the phase. 0 when a
@@ -555,14 +555,14 @@ ps5vk_output_vblank_period_ns(int handle)
  * fresh handle, before the flip rate, which is where the console accepted it. A
  * refusal is not an error: the output presents at 59.94 Hz, and says so once.
  *
- * A fixed-rate title verifies the accepted mode from vblanks: a tester's
- * console accepted it while its display remained at 60 Hz. A retail VRR title
- * does not: before the first presents its output may legitimately idle at the
- * 48 Hz floor, so a successful configuration is authoritative. NULL when
- * VideoOut does not open. */
+ * Both policies measure bare vblanks after configuration. Fixed-rate titles
+ * require a fast period; VRR metadata permits slow idle periods except the
+ * observed 59.94 Hz band. NULL when output initialization fails. */
 static struct ps5vk_video_out *
 ps5vk_output_open_handle(uint32_t attribute3)
 {
+   if (ps5vk_output_restore_failed)
+      return NULL;
    struct ps5vk_video_out *const video = calloc(1, sizeof(*video));
    if (video == NULL)
       return NULL;
@@ -584,14 +584,18 @@ ps5vk_output_open_handle(uint32_t attribute3)
          ps5vk_choose_high_refresh(attribute3, supported, configured);
       video->high_frame_rate = policy != PS5VK_HIGH_REFRESH_UNAVAILABLE;
       char line[200];
-      if (policy == PS5VK_HIGH_REFRESH_TRUST_VRR) {
-         snprintf(line, sizeof(line),
-                  "[ps5vk] output: 119.88 Hz selected with title VRR metadata\n");
-      } else if (policy == PS5VK_HIGH_REFRESH_VERIFY_FIXED) {
+      if (policy != PS5VK_HIGH_REFRESH_UNAVAILABLE) {
          const uint64_t period = ps5vk_output_vblank_period_ns(video->handle);
-         if (period == 0 || period > PS5VK_OUTPUT_HIGH_REFRESH_LIMIT_NS) {
+         if (!ps5vk_keep_high_refresh(policy, period)) {
             const int restored = sceVideoOutConfigureOutput(
                video->handle, PS5VK_VIDEO_OUT_MODE_RESTORE, NULL, NULL, NULL);
+            if (restored != 0) {
+               mesa_loge("sceVideoOutConfigureOutput(restore) failed: 0x%08x", (unsigned)restored);
+               ps5vk_output_restore_failed = true;
+               ps5vk_video_out_close(video);
+               free(video);
+               return NULL;
+            }
             video->high_frame_rate = false;
             if (period == 0)
                snprintf(line, sizeof(line),
@@ -601,8 +605,13 @@ ps5vk_output_open_handle(uint32_t attribute3)
             else
                snprintf(line, sizeof(line),
                         "[ps5vk] output: 119.88 Hz accepted, but a vblank comes every %.3f ms; "
-                        "the display is not refreshing at 120 Hz, so 59.94 Hz is restored (0x%08x)\n",
+                        "the measured period is inconsistent with the selected mode, so 59.94 Hz "
+                        "is restored (0x%08x)\n",
                         (double)period / 1e6, (unsigned)restored);
+         } else if (policy == PS5VK_HIGH_REFRESH_TRUST_VRR) {
+            snprintf(line, sizeof(line),
+                     "[ps5vk] output: 119.88 Hz selected with title VRR metadata, "
+                     "idle vblank every %.3f ms\n", (double)period / 1e6);
          } else {
             snprintf(line, sizeof(line), "[ps5vk] output: 119.88 Hz selected, a vblank every %.3f ms\n",
                      (double)period / 1e6);
@@ -683,7 +692,7 @@ ps5vk_video_out_open(struct ps5vk_device *device, uint32_t attribute3,
       ps5vk_output = ps5vk_output_open_handle(attribute3);
    if (ps5vk_output == NULL) {
       pthread_mutex_unlock(&ps5vk_output_lock);
-      return vk_errorf(device, VK_ERROR_INITIALIZATION_FAILED, "sceVideoOutOpen failed");
+      return vk_errorf(device, VK_ERROR_INITIALIZATION_FAILED, "VideoOut initialization failed");
    }
    if (!ps5vk_output->registered) {
       const VkResult result = ps5vk_video_out_register(device, ps5vk_output);

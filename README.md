@@ -72,12 +72,15 @@ is the round-by-round record.
   PS5 GPU
 ```
 
-High-refresh metadata always carries `attribute3` bit `0x40`.
-`sce_sys/param-runner-vrr.json` pairs it with retail VRR bit `0x40000`;
-`sce_sys/param-runner-hfr.json` retains the older `0x80000` pairing as the
-fixed-rate diagnostic. A VRR output may idle at its 48 Hz floor before the
-first presents, so the driver trusts a successful mode change for the VRR
-fixture while retaining measured-vblank verification for the fixed-rate one.
+High-refresh metadata carries `attribute3` bit `0x40`.
+`sce_sys/param-runner-vrr.json` pairs it with `0x40000`;
+`sce_sys/param-runner-hfr.json` retains the `0x80000` pairing as a
+fixed-rate diagnostic. After positive support and successful configuration,
+the driver measures idle vblanks. It rejects failed measurements and, for
+fixed-rate titles, periods over 12.5 ms. For titles with the VRR metadata
+combination it accepts positive periods outside the inclusive 16.2–17.2 ms
+band, allowing slower idle periods. Rejected measurements trigger a restore
+request to the default mode.
 
 What stands on the console (2026-10-01, PS5 Mesa `504adad`):
 
